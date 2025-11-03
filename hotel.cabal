@@ -1,0 +1,60 @@
+cabal-version:      3.0
+name:               hotel
+version:            0.0.0.1
+synopsis:           an highly opinionated Haskell Open TELemetry library
+-- description:
+license:            ISC
+license-file:       LICENSE
+author:             Volsand
+maintainer:         valdsonfrancisco.jr@gmail.com
+-- copyright:
+category:           System
+build-type:         Simple
+extra-doc-files:    CHANGELOG.md
+-- extra-source-files:
+
+common warnings
+    ghc-options:
+        -Wall
+        -Wincomplete-uni-patterns
+        -Wincomplete-record-updates
+        -Wmonomorphism-restriction
+        -Wmissing-local-signatures
+        -Wmissing-exported-signatures
+        -Wmissing-export-lists
+        -Wmissing-home-modules
+        -Widentities
+        -Wredundant-constraints
+        -Wpartial-fields
+    build-depends:
+        base ^>=4.19.2.0,
+        text,
+        co-log-core,
+        http-client
+    default-language: Haskell2010
+        
+
+library
+    import:           warnings
+    exposed-modules:
+        System.Log,
+    other-modules:
+        Paths_hotel
+    -- other-extensions:
+    build-depends:
+        bytestring,
+        hs-opentelemetry-otlp,
+        lens-family,
+        proto-lens,
+        time
+    hs-source-dirs:   src
+
+test-suite hotel-test
+    import:           warnings
+    -- other-modules:
+    -- other-extensions:
+    type:             exitcode-stdio-1.0
+    hs-source-dirs:   test
+    main-is:          Main.hs
+    build-depends:
+        hotel
