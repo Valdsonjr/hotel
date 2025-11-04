@@ -1,6 +1,5 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE RankNTypes #-}
 
 module System.Log
   ( Config,
@@ -15,15 +14,17 @@ where
 
 import Colog.Core
   ( LogAction (LogAction),
-    Severity
-      ( Debug,
-        Error,
-        Info,
-        Warning
-      ),
+    Severity (..),
     cmapM,
   )
-import Control.Concurrent (MVar, forkIO, modifyMVar, modifyMVar_, newMVar, threadDelay)
+import Control.Concurrent
+  ( MVar,
+    forkIO,
+    modifyMVar_,
+    newMVar,
+    swapMVar,
+    threadDelay,
+  )
 import Control.Exception (bracket, try)
 import Control.Monad (forever, unless, void)
 import qualified Data.ByteString as SB
@@ -36,8 +37,8 @@ import qualified Data.Text.Lazy as L
 import Data.Time.Clock.POSIX (getPOSIXTime)
 import Data.Version (showVersion)
 import Data.Word (Word16, Word32, Word64, Word8)
-import Debug.Trace (traceShowId)
-import Lens.Family2 (Setter, set)
+import Debug.Trace (traceShowM)
+import Lens.Family2 (set)
 import Network.HTTP.Client
   ( HttpException,
     Manager,
@@ -55,6 +56,7 @@ import qualified Proto.Opentelemetry.Proto.Logs.V1.Logs as Logs
 import qualified Proto.Opentelemetry.Proto.Logs.V1.Logs_Fields as Logs
 import Proto.Opentelemetry.Proto.Resource.V1.Resource (Resource)
 
+-- | Logger and OTLP config
 data Config = Config
   { resourceAttrs :: [Common.KeyValue],
     otlpEndpoint :: String,
@@ -63,11 +65,61 @@ data Config = Config
     manager :: Manager
   }
 
-mkHttpConfig :: [Common.KeyValue] -> String -> Word -> Word -> Manager -> Config
+-- | "smart" constructor for a http-based logger config
+mkHttpConfig ::
+  -- | List of attributes of a Resource, this means that if you have multiple resources you must define multiple configurations and get multiple loggers
+  [Common.KeyValue] ->
+  -- | HTTP endpoint of an otlp-compatible service
+  String ->
+  -- | Flush interval in seconds
+  Word ->
+  -- | Max number of log entries before flush
+  Word ->
+  Manager ->
+  Config
 mkHttpConfig = Config
 
+-- | Construct KeyValue's
 (.=) :: (OtlpAnyValue a) => S.Text -> a -> Common.KeyValue
 (.=) k v = set Common.value (anyValue v) $ set Common.key k defMessage
+
+-- | HOTel simplified log record, it's not supposed to be used directly in application code instead, you should write a map between your domain log events and this one and use it like
+-- let appLogger = contramap domainEventToRecord hotelLogger
+data Record sev = Record
+  { severity :: Maybe sev,
+    time :: Maybe Word64,
+    message :: S.Text,
+    attributes :: [Common.KeyValue],
+    traceId :: Maybe SB.ByteString,
+    spanId :: Maybe SB.ByteString,
+    eventName :: Maybe S.Text
+  }
+
+-- | Bracket-style logger that flushes all buffered events gracefuly on exit
+withHotelLogger ::
+  (OtlpSeverity sev) =>
+  Config ->
+  (LogAction IO (Record sev) -> IO a) ->
+  IO a
+withHotelLogger cfg action = do
+  bracket
+    (mkHotelLogger cfg)
+    (\(_, mvar) -> flushAll mvar cfg)
+    (\(logAction, _) -> action logAction)
+
+--------------------------------------------------------------------------------
+-- Typeclasses and instances
+class OtlpSeverity a where
+  toTextAndNumber :: a -> (S.Text, Logs.SeverityNumber)
+
+instance OtlpSeverity () where
+  toTextAndNumber () = ("unknown", Logs.SEVERITY_NUMBER_UNSPECIFIED)
+
+instance OtlpSeverity Severity where
+  toTextAndNumber Debug = ("debug", Logs.SEVERITY_NUMBER_DEBUG)
+  toTextAndNumber Info = ("info", Logs.SEVERITY_NUMBER_INFO)
+  toTextAndNumber Warning = ("warn", Logs.SEVERITY_NUMBER_WARN)
+  toTextAndNumber Error = ("error", Logs.SEVERITY_NUMBER_ERROR)
 
 class OtlpAnyValue a where
   anyValue :: a -> Common.AnyValue
@@ -133,124 +185,12 @@ instance OtlpAnyValue [Char] where
 instance OtlpAnyValue [Common.KeyValue] where
   anyValue x = set Common.kvlistValue (set Common.values x defMessage) defMessage
 
-data Record sev = Record
-  { severity :: Maybe sev,
-    time :: Maybe Word64,
-    message :: S.Text,
-    attributes :: [Common.KeyValue],
-    traceId :: Maybe SB.ByteString,
-    spanId :: Maybe SB.ByteString,
-    eventName :: Maybe S.Text
-  }
-
-setWhenJust :: Setter s s a a -> Maybe a -> s -> s
-setWhenJust setter = maybe id (set setter)
-
-class OtlpSeverity a where
-  toTextAndNumber :: a -> (S.Text, Logs.SeverityNumber)
-
-instance OtlpSeverity () where
-  toTextAndNumber () = ("Unknown", Logs.SEVERITY_NUMBER_UNSPECIFIED)
-
-instance OtlpSeverity Severity where
-  toTextAndNumber Debug = ("debug", Logs.SEVERITY_NUMBER_DEBUG)
-  toTextAndNumber Info = ("info", Logs.SEVERITY_NUMBER_INFO)
-  toTextAndNumber Warning = ("warn", Logs.SEVERITY_NUMBER_WARN)
-  toTextAndNumber Error = ("error", Logs.SEVERITY_NUMBER_ERROR)
-
-getUnixTimeInNanoseconds :: IO Word64
-getUnixTimeInNanoseconds = do
-  posixTime <- getPOSIXTime
-  pure $ truncate (posixTime * 1000000000)
-
-toOtlp :: (OtlpSeverity sev) => Word64 -> Record sev -> Logs.LogRecord
-toOtlp t rec =
-  set Logs.attributes (attributes rec) $
-    setWhenJust Logs.severityNumber (snd . toTextAndNumber <$> severity rec) $
-      setWhenJust Logs.severityText (fst . toTextAndNumber <$> severity rec) $
-        setWhenJust Logs.eventName (eventName rec) $
-          setWhenJust Logs.traceId (traceId rec) $
-            setWhenJust Logs.spanId (spanId rec) $
-              set Logs.observedTimeUnixNano t $
-                set Logs.body (anyValue (message rec)) $
-                  set
-                    Logs.timeUnixNano
-                    (fromMaybe t $ time rec)
-                    defMessage
-
-mkHotelLogger ::
-  (OtlpSeverity sev) =>
-  Config ->
-  IO (LogAction IO (Record sev), MVar [Logs.LogRecord])
-mkHotelLogger cfg = do
-  (otlpLogger, mvar) <- mkOtlpLoggerWithMVar cfg
-  pure (cmapM (\x -> (`toOtlp` x) <$> getUnixTimeInNanoseconds) otlpLogger, mvar)
-
-mkOtlpLoggerWithMVar :: Config -> IO (LogAction IO Logs.LogRecord, MVar [Logs.LogRecord])
-mkOtlpLoggerWithMVar cfg = do
-  mvar <- newMVar []
-
-  let flushAll = do
-        logsToSend <- modifyMVar mvar (\logs -> pure ([], logs))
-        unless (null logsToSend) $ flushLogs cfg logsToSend
-
-  let flushIntervalMicros = flushIntervalSec cfg * 1000000
-
-  -- flush periódico
-  void $ forkIO $ forever $ do
-    threadDelay $ fromIntegral flushIntervalMicros
-    flushAll
-
-  let action = LogAction $ \logRec ->
-        modifyMVar_ mvar $ \logs ->
-          let newLogs = logRec : logs
-           in if length newLogs >= fromIntegral (bufferLimit cfg)
-                then flushLogs cfg newLogs >> pure []
-                else pure newLogs
-
-  pure (action, mvar)
-
-flushLogs :: Config -> [Logs.LogRecord] -> IO ()
-flushLogs cfg logsToSend = do
-  let resourceLogs = mkResourceLogsBatch (mkResource $ resourceAttrs cfg) $ traceShowId logsToSend
-      request = mkExportRequest resourceLogs
-  sendOtlpLog (otlpEndpoint cfg) request (manager cfg)
-
-withHotelLogger ::
-  (OtlpSeverity sev) =>
-  Config ->
-  (LogAction IO (Record sev) -> IO a) ->
-  IO a
-withHotelLogger cfg action = do
-  bracket
-    (mkHotelLogger cfg) -- retorna (LogAction, MVar)
-    ( \(_, mvar) -> do
-        -- cleanup
-        logsToSend <- modifyMVar mvar (\logs -> pure ([], logs))
-        unless (null logsToSend) $ flushLogs cfg logsToSend
-    )
-    (\(logAction, _) -> action logAction)
-
-mkResourceLogsBatch :: Resource -> [Logs.LogRecord] -> Logs.ResourceLogs
-mkResourceLogsBatch res logRecs =
-  set Logs.scopeLogs [set Logs.scope scope $ set Logs.logRecords logRecs defMessage] $
-    set Logs.resource res defMessage
-  where
-    scope :: Common.InstrumentationScope
-    scope =
-      set Common.version (S.pack $ showVersion version) $
-        set Common.name "haskell.hotel.logger" defMessage
-
 --------------------------------------------------------------------------------
--- Funções auxiliares
+-- Auxiliary functions
 
 -- | Constrói um Resource OTLP a partir da lista de atributos do Config
 mkResource :: [Common.KeyValue] -> Resource
 mkResource attrs = set Logs.attributes attrs defMessage
-
--- | Cria um ExportLogsServiceRequest pronto para serialização OTLP
-mkExportRequest :: Logs.ResourceLogs -> Logs.ExportLogsServiceRequest
-mkExportRequest resLog = set Logs.resourceLogs [resLog] defMessage
 
 -- | Envia o payload OTLP via HTTP/Protobuf
 sendOtlpLog :: String -> Logs.ExportLogsServiceRequest -> Manager -> IO ()
@@ -266,4 +206,72 @@ sendOtlpLog route payload man = do
   result <- try $ httpNoBody request man
   case result of
     Left e -> putStrLn $ "OTLP log send failed: " <> show (e :: HttpException)
-    Right _ -> pure ()
+    Right res -> traceShowM res
+
+getUnixTimeInNanoseconds :: IO Word64
+getUnixTimeInNanoseconds = do
+  posixTime <- getPOSIXTime
+  pure $ truncate (posixTime * 1000000000)
+
+toOtlp :: (OtlpSeverity sev) => Word64 -> Record sev -> Logs.LogRecord
+toOtlp t rec =
+  set Logs.attributes (attributes rec) $
+    maybe id (set Logs.severityNumber . snd . toTextAndNumber) (severity rec) $
+      maybe id (set Logs.severityText . fst . toTextAndNumber) (severity rec) $
+        maybe id (set Logs.eventName) (eventName rec) $
+          maybe id (set Logs.traceId) (traceId rec) $
+            maybe id (set Logs.spanId) (spanId rec) $
+              set Logs.observedTimeUnixNano t $
+                set Logs.body (anyValue (message rec)) $
+                  set
+                    Logs.timeUnixNano
+                    (fromMaybe t $ time rec)
+                    defMessage
+
+mkResourceLogsBatch :: Resource -> [Logs.LogRecord] -> Logs.ResourceLogs
+mkResourceLogsBatch res logRecs =
+  set Logs.scopeLogs [scopeLog] $ set Logs.resource res defMessage
+  where
+    scopeLog :: Logs.ScopeLogs
+    scopeLog = set Logs.scope scope $ set Logs.logRecords logRecs defMessage
+
+    scope :: Common.InstrumentationScope
+    scope =
+      set Common.version (S.pack $ showVersion version) $
+        set Common.name "haskell.hotel.logger" defMessage
+
+mkHotelLogger ::
+  (OtlpSeverity sev) =>
+  Config ->
+  IO (LogAction IO (Record sev), MVar [Logs.LogRecord])
+mkHotelLogger cfg = do
+  (otlpLogger, mvar) <- mkOtlpLoggerWithMVar cfg
+  pure (cmapM (\x -> (`toOtlp` x) <$> getUnixTimeInNanoseconds) otlpLogger, mvar)
+
+mkOtlpLoggerWithMVar :: Config -> IO (LogAction IO Logs.LogRecord, MVar [Logs.LogRecord])
+mkOtlpLoggerWithMVar cfg = do
+  mvar <- newMVar []
+
+  void $ forkIO $ forever $ do
+    threadDelay $ fromIntegral $ flushIntervalSec cfg * 1000000
+    flushAll mvar cfg
+
+  let action = LogAction $ \logRec ->
+        modifyMVar_ mvar $ \logs ->
+          let newLogs = logRec : logs
+           in if length newLogs >= fromIntegral (bufferLimit cfg)
+                then flushLogs cfg newLogs >> pure []
+                else pure newLogs
+
+  pure (action, mvar)
+
+flushAll :: MVar [Logs.LogRecord] -> Config -> IO ()
+flushAll mvar cfg = do
+  logsToSend <- swapMVar mvar []
+  unless (null logsToSend) $ flushLogs cfg logsToSend
+
+flushLogs :: Config -> [Logs.LogRecord] -> IO ()
+flushLogs cfg logsToSend = do
+  let resourceLogs = mkResourceLogsBatch (mkResource $ resourceAttrs cfg) logsToSend
+      request = set Logs.resourceLogs [resourceLogs] defMessage
+  sendOtlpLog (otlpEndpoint cfg) request (manager cfg)

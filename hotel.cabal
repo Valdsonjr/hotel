@@ -16,23 +16,19 @@ extra-doc-files:    CHANGELOG.md
 common warnings
     ghc-options:
         -Wall
-        -Wincomplete-uni-patterns
-        -Wincomplete-record-updates
-        -Wmonomorphism-restriction
-        -Wmissing-local-signatures
-        -Wmissing-exported-signatures
-        -Wmissing-export-lists
-        -Wmissing-home-modules
         -Widentities
-        -Wredundant-constraints
+        -Wincomplete-record-updates
+        -Wincomplete-uni-patterns
         -Wpartial-fields
+        -Wredundant-constraints
+        -Wunused-packages
+
     build-depends:
-        base ^>=4.19.2.0,
-        text,
+        base >=4.18.3.0,
         co-log-core,
-        http-client
+        http-client,
+        text
     default-language: Haskell2010
-        
 
 library
     import:           warnings
