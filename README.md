@@ -1,2 +1,2 @@
 # hotel
-a highly opinionated Haskell Open TELemetry library
+a highly opinionated **H**askell **O**pen **TEL**emetry library
