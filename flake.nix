@@ -30,8 +30,7 @@
       shellHook = ''
         export OLD_PS1="$PS1"
         export PS1="$PS1 (haskell)"
-        echo "🚀 Ambiente Haskell ativado!"
-        echo "ghc versão: $(ghc --version)"
+        ghc --version
         trap 'export PS1="$OLD_PS1"' EXIT
       '';
     };
